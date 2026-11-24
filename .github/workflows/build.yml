@@ -1,0 +1,126 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: FifineK420Studio
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  test:
+    name: Lint & tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: System libraries (Qt offscreen, PortAudio, FFmpeg)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libportaudio2 libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 ffmpeg
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest ruff
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Byte-compile
+        run: python -m compileall -q k420studio run.py
+
+      - name: Pytest
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -v
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+          - os: ubuntu-22.04
+            label: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: System libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libportaudio2 libegl1 libgl1 libxkbcommon0
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: PyInstaller
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --clean --windowed \
+            --name "$APP_NAME" \
+            --collect-all imageio_ffmpeg \
+            --exclude-module tkinter \
+            run.py
+
+      - name: Smoke test (bundled ffmpeg is present)
+        shell: bash
+        run: |
+          FF="$(find "dist/$APP_NAME" -path '*imageio_ffmpeg/binaries/ffmpeg*' -type f | head -n 1)"
+          echo "Bundled ffmpeg: $FF"
+          test -n "$FF"
+
+      - name: Package
+        shell: bash
+        env:
+          LABEL: ${{ matrix.label }}
+        run: |
+          cp README.md "dist/$APP_NAME/"
+          python -c "import os, shutil; n = os.environ['APP_NAME']; shutil.make_archive(n + '-' + os.environ['LABEL'], 'zip', 'dist', n)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ matrix.label }}
+          path: ${{ env.APP_NAME }}-${{ matrix.label }}.zip
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
